@@ -792,8 +792,10 @@ impl Vcpu {
                 error!("Failed signaling vcpu exit event: {}", e);
             }
         }
-        // State machine reached its end.
-        StateMachine::finish(Self::exited)
+        // State machine reached its end, but move to 'paused' state
+        // to keep the thread, since thread cleanup on libc may call
+        // syscalls which we don't want to whitelist (#1456)
+        StateMachine::next(Self::paused)
     }
 }
 
@@ -842,11 +844,6 @@ impl VcpuHandle {
 
     pub fn response_receiver(&self) -> &Receiver<VcpuResponse> {
         &self.response_receiver
-    }
-
-    #[allow(dead_code)]
-    pub fn join_vcpu_thread(self) -> thread::Result<()> {
-        self.vcpu_thread.join()
     }
 }
 
@@ -1247,13 +1244,17 @@ mod tests {
         // Stop it by sending exit.
         assert!(vcpu_handle.send_event(VcpuEvent::Exit).is_ok());
 
-        // Validate vCPU thread ends execution.
-        vcpu_handle
-            .join_vcpu_thread()
-            .expect("failed to join thread");
-
-        // Validate that the vCPU signaled its exit.
-        assert_eq!(vcpu_exit_evt.read().unwrap(), 1);
+        // Sending exit won't stop the thread.
+        // Instead of waiting the completion of the thread, we need to poll the fd.
+        for _i in 0..10 {
+            match vcpu_exit_evt.read() {
+                Ok(x) => assert_eq!(x, 1),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(100))
+                }
+                Err(e) => panic!("failed to read the exit event: {}", e),
+            }
+        }
     }
 
     #[test]
