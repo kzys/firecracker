@@ -11,6 +11,7 @@ use std::io;
 use std::result;
 use std::sync::atomic::{fence, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
+use std::sync::{Arc, Barrier};
 use std::thread;
 
 use super::TimestampUs;
@@ -570,6 +571,10 @@ impl Vcpu {
     pub fn start_threaded(mut self, seccomp_filter: BpfProgram) -> Result<VcpuHandle> {
         let event_sender = self.event_sender.take().unwrap();
         let response_receiver = self.response_receiver.take().unwrap();
+
+        let exit_barrier = Arc::new(Barrier::new(2));
+        let barrier = exit_barrier.clone();
+
         let vcpu_thread = thread::Builder::new()
             .name(format!("fc_vcpu {}", self.cpu_index()))
             .spawn(move || {
@@ -577,6 +582,11 @@ impl Vcpu {
                     .expect("Cannot cleanly initialize vcpu TLS.");
 
                 self.run(seccomp_filter);
+
+                // Don't exit from the thread until we have another cue on the VcpuHandle below.
+                // Thread cleanup on a libc may call syscalls which we don't want to whitelist.
+                // For example, musl calls sigprocmask. See #1456 for the detail.
+                barrier.wait();
             })
             .map_err(Error::VcpuSpawn)?;
 
@@ -584,6 +594,7 @@ impl Vcpu {
             event_sender,
             response_receiver,
             vcpu_thread,
+            exit_barrier,
         })
     }
 
@@ -792,10 +803,8 @@ impl Vcpu {
                 error!("Failed signaling vcpu exit event: {}", e);
             }
         }
-        // State machine reached its end, but move to 'paused' state
-        // to keep the thread, since thread cleanup on libc may call
-        // syscalls which we don't want to whitelist (#1456)
-        StateMachine::next(Self::paused)
+        // State machine reached its end.
+        StateMachine::finish(Self::exited)
     }
 }
 
@@ -827,6 +836,7 @@ pub struct VcpuHandle {
     event_sender: Sender<VcpuEvent>,
     response_receiver: Receiver<VcpuResponse>,
     vcpu_thread: thread::JoinHandle<()>,
+    exit_barrier: Arc<Barrier>,
 }
 
 impl VcpuHandle {
@@ -844,6 +854,12 @@ impl VcpuHandle {
 
     pub fn response_receiver(&self) -> &Receiver<VcpuResponse> {
         &self.response_receiver
+    }
+
+    #[allow(dead_code)]
+    pub fn join_vcpu_thread(self) -> thread::Result<()> {
+        self.exit_barrier.wait();
+        self.vcpu_thread.join()
     }
 }
 
@@ -1244,17 +1260,13 @@ mod tests {
         // Stop it by sending exit.
         assert!(vcpu_handle.send_event(VcpuEvent::Exit).is_ok());
 
-        // Sending exit won't stop the thread.
-        // Instead of waiting the completion of the thread, we need to poll the fd.
-        for _i in 0..10 {
-            match vcpu_exit_evt.read() {
-                Ok(x) => assert_eq!(x, 1),
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(100))
-                }
-                Err(e) => panic!("failed to read the exit event: {}", e),
-            }
-        }
+        // Validate vCPU thread ends execution.
+        vcpu_handle
+            .join_vcpu_thread()
+            .expect("failed to join thread");
+
+        // Validate that the vCPU signaled its exit.
+        assert_eq!(vcpu_exit_evt.read().unwrap(), 1);
     }
 
     #[test]
