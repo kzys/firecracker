@@ -1,7 +1,7 @@
 // Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use libc::{_exit, c_int, c_void, siginfo_t, SIGBUS, SIGSEGV, SIGSYS};
+use libc::{_exit, c_int, c_void, siginfo_t, SIGBUS, SIGSEGV, SIGSYS, SIGTERM};
 
 use logger::{Metric, METRICS};
 use utils::signal::register_signal_handler;
@@ -94,6 +94,36 @@ extern "C" fn sigbus_sigsegv_handler(num: c_int, info: *mut siginfo_t, _unused: 
     };
 }
 
+/// Signal handler for `SIGTERM`.
+///
+/// Logs an error message and terminates the process with a specific exit code.
+extern "C" fn sigterm_handler(num: c_int, info: *mut siginfo_t, _unused: *mut c_void) {
+    // Safe because we're just reading some fields from a supposedly valid argument.
+    let si_signo = unsafe { (*info).si_signo };
+    let si_code = unsafe { (*info).si_code };
+
+    // Sanity check. The condition should never be true.
+    if num != si_signo || (num != SIGTERM) {
+        // Safe because we're terminating the process anyway.
+        unsafe { _exit(i32::from(super::FC_EXIT_CODE_UNEXPECTED_ERROR)) };
+    }
+
+    error!(
+        "Shutting down VM after intercepting signal {}, code {}.",
+        si_signo, si_code
+    );
+
+    // Safe because we're terminating the process anyway. We don't actually do anything when
+    // running unit tests.
+    #[cfg(not(test))]
+    unsafe {
+        _exit(i32::from(match si_signo {
+            SIGTERM => super::FC_EXIT_CODE_SIGTERM,
+            _ => super::FC_EXIT_CODE_UNEXPECTED_ERROR,
+        }))
+    };
+}
+
 /// Registers all the required signal handlers.
 ///
 /// Custom handlers are installed for: `SIGBUS`, `SIGSEGV`, `SIGSYS`.
@@ -105,6 +135,7 @@ pub fn register_signal_handlers() -> utils::errno::Result<()> {
     register_signal_handler(SIGSYS, sigsys_handler)?;
     register_signal_handler(SIGBUS, sigbus_sigsegv_handler)?;
     register_signal_handler(SIGSEGV, sigbus_sigsegv_handler)?;
+    register_signal_handler(SIGTERM, sigterm_handler)?;
 
     Ok(())
 }

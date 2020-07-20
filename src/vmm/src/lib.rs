@@ -101,6 +101,8 @@ pub const FC_EXIT_CODE_BAD_SYSCALL: u8 = 148;
 pub const FC_EXIT_CODE_SIGBUS: u8 = 149;
 /// Firecracker was shut down after intercepting `SIGSEGV`.
 pub const FC_EXIT_CODE_SIGSEGV: u8 = 150;
+/// Firecracker was shut down after intercepting `SIGTERM`.
+pub const FC_EXIT_CODE_SIGTERM: u8 = 151;
 /// Bad configuration for microvm's resources, when using a single json.
 pub const FC_EXIT_CODE_BAD_CONFIGURATION: u8 = 152;
 /// Command line arguments parsing error.
